@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { errorHandler } = require('./src/middleware/errorHandler');
+const { ensureSchema } = require('./src/config/ensureSchema');
 const authRoutes = require('./src/routes/auth.routes');
 const adminRoutes = require('./src/routes/admin.routes');
 const publicRoutes = require('./src/routes/public.routes');
@@ -26,6 +27,16 @@ app.get('/api/health', (req, res) => {
 // Error handler
 app.use(errorHandler);
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 AnVy Backend running on port ${PORT}`);
-});
+async function start() {
+  try {
+    await ensureSchema();
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 AnVy Backend running on port ${PORT}`);
+    });
+  } catch (err) {
+    console.error('❌ Failed to ensure database schema:', err.message);
+    process.exit(1);
+  }
+}
+
+start();
