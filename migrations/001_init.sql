@@ -46,3 +46,41 @@ VALUES
   (6, 'Thứ 7', TRUE, '08:00', '12:00'),
   (0, 'Chủ nhật', FALSE, NULL, NULL)
 ON CONFLICT (weekday) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS wheel_prizes (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(120) NOT NULL,
+  description TEXT DEFAULT '',
+  total_quantity INTEGER NOT NULL DEFAULT 0 CHECK (total_quantity >= 0),
+  remaining_quantity INTEGER NOT NULL DEFAULT 0 CHECK (remaining_quantity >= 0),
+  color VARCHAR(20) NOT NULL DEFAULT '#005eb8',
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS wheel_spins (
+  id SERIAL PRIMARY KEY,
+  prize_id INTEGER REFERENCES wheel_prizes(id) ON DELETE SET NULL,
+  prize_name VARCHAR(120) NOT NULL,
+  prize_description TEXT DEFAULT '',
+  prize_color VARCHAR(20) NOT NULL DEFAULT '#005eb8',
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+ALTER TABLE wheel_spins
+  ADD COLUMN IF NOT EXISTS phone VARCHAR(20),
+  ADD COLUMN IF NOT EXISTS spin_date DATE;
+
+CREATE INDEX IF NOT EXISTS idx_wheel_spins_phone_spin_date ON wheel_spins(phone, spin_date);
+
+CREATE TABLE IF NOT EXISTS wheel_settings (
+  id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  max_daily_spins_per_phone INTEGER NOT NULL DEFAULT 1 CHECK (max_daily_spins_per_phone >= 1),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+INSERT INTO wheel_settings (id, max_daily_spins_per_phone)
+VALUES (1, 1)
+ON CONFLICT (id) DO NOTHING;

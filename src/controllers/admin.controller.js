@@ -1,6 +1,53 @@
 const bcrypt = require('bcryptjs');
 const pool = require('../config/db');
 const { normalizeAvailabilityRow, timeToMinutes } = require('../utils/availability');
+const { normalizePrizeRow, isValidHexColor, normalizeWheelSettingsRow } = require('../utils/wheel');
+
+function validatePrizePayload(body) {
+  const name = String(body.name || '').trim();
+  const description = String(body.description || '').trim();
+  const color = String(body.color || '').trim();
+  const totalQuantity = Number(body.total_quantity);
+  const remainingQuantity = Number(body.remaining_quantity);
+  const sortOrder = Number(body.sort_order || 0);
+  const isActive = body.is_active !== false;
+
+  if (!name) {
+    return { error: 'Vui lòng nhập tên giải thưởng.' };
+  }
+
+  if (!Number.isInteger(totalQuantity) || totalQuantity < 0) {
+    return { error: 'Tổng số lượng phải là số nguyên không âm.' };
+  }
+
+  if (!Number.isInteger(remainingQuantity) || remainingQuantity < 0) {
+    return { error: 'Số lượng còn lại phải là số nguyên không âm.' };
+  }
+
+  if (remainingQuantity > totalQuantity) {
+    return { error: 'Số lượng còn lại không được lớn hơn tổng số lượng.' };
+  }
+
+  if (!Number.isInteger(sortOrder)) {
+    return { error: 'Thứ tự hiển thị không hợp lệ.' };
+  }
+
+  if (!isValidHexColor(color)) {
+    return { error: 'Màu hiển thị phải là mã HEX hợp lệ.' };
+  }
+
+  return {
+    value: {
+      name,
+      description,
+      color,
+      totalQuantity,
+      remainingQuantity,
+      sortOrder,
+      isActive,
+    },
+  };
+}
 
 async function getDefaultAccount(req, res, next) {
   try {
@@ -157,6 +204,150 @@ async function updateAvailabilitySettings(req, res, next) {
   }
 }
 
+async function listWheelPrizes(req, res, next) {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, description, total_quantity, remaining_quantity, color, is_active, sort_order, created_at, updated_at
+       FROM wheel_prizes
+       ORDER BY is_active DESC, sort_order ASC, id ASC`
+    );
+
+    res.json(result.rows.map(normalizePrizeRow));
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getWheelSettings(req, res, next) {
+  try {
+    const result = await pool.query(
+      `SELECT max_daily_spins_per_phone, updated_at
+       FROM wheel_settings
+       WHERE id = 1`
+    );
+
+    res.json(normalizeWheelSettingsRow(result.rows[0] || { max_daily_spins_per_phone: 1 }));
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function updateWheelSettings(req, res, next) {
+  try {
+    const maxDailySpins = Number(req.body.max_daily_spins_per_phone);
+
+    if (!Number.isInteger(maxDailySpins) || maxDailySpins < 1 || maxDailySpins > 20) {
+      return res.status(400).json({ error: 'Giới hạn lượt chơi mỗi ngày phải là số nguyên từ 1 đến 20.' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO wheel_settings (id, max_daily_spins_per_phone, updated_at)
+       VALUES (1, $1, NOW())
+       ON CONFLICT (id)
+       DO UPDATE SET max_daily_spins_per_phone = EXCLUDED.max_daily_spins_per_phone,
+                     updated_at = NOW()
+       RETURNING max_daily_spins_per_phone, updated_at`,
+      [maxDailySpins]
+    );
+
+    res.json(normalizeWheelSettingsRow(result.rows[0]));
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function createWheelPrize(req, res, next) {
+  try {
+    const validation = validatePrizePayload(req.body);
+    if (validation.error) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const { name, description, color, totalQuantity, remainingQuantity, sortOrder, isActive } = validation.value;
+    const result = await pool.query(
+      `INSERT INTO wheel_prizes (name, description, total_quantity, remaining_quantity, color, is_active, sort_order, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       RETURNING id, name, description, total_quantity, remaining_quantity, color, is_active, sort_order, created_at, updated_at`,
+      [name, description, totalQuantity, remainingQuantity, color, isActive, sortOrder]
+    );
+
+    res.status(201).json(normalizePrizeRow(result.rows[0]));
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function updateWheelPrize(req, res, next) {
+  try {
+    const prizeId = Number(req.params.id);
+    if (!Number.isInteger(prizeId) || prizeId <= 0) {
+      return res.status(400).json({ error: 'Giải thưởng không hợp lệ.' });
+    }
+
+    const validation = validatePrizePayload(req.body);
+    if (validation.error) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const { name, description, color, totalQuantity, remainingQuantity, sortOrder, isActive } = validation.value;
+    const result = await pool.query(
+      `UPDATE wheel_prizes
+       SET name = $1,
+           description = $2,
+           total_quantity = $3,
+           remaining_quantity = $4,
+           color = $5,
+           is_active = $6,
+           sort_order = $7,
+           updated_at = NOW()
+       WHERE id = $8
+       RETURNING id, name, description, total_quantity, remaining_quantity, color, is_active, sort_order, created_at, updated_at`,
+      [name, description, totalQuantity, remainingQuantity, color, isActive, sortOrder, prizeId]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: 'Không tìm thấy giải thưởng.' });
+    }
+
+    res.json(normalizePrizeRow(result.rows[0]));
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function deleteWheelPrize(req, res, next) {
+  try {
+    const prizeId = Number(req.params.id);
+    if (!Number.isInteger(prizeId) || prizeId <= 0) {
+      return res.status(400).json({ error: 'Giải thưởng không hợp lệ.' });
+    }
+
+    const result = await pool.query('DELETE FROM wheel_prizes WHERE id = $1 RETURNING id', [prizeId]);
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: 'Không tìm thấy giải thưởng.' });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function listWheelSpins(req, res, next) {
+  try {
+    const result = await pool.query(
+      `SELECT id, prize_id, prize_name, prize_description, prize_color, phone, spin_date, created_at
+       FROM wheel_spins
+       ORDER BY created_at DESC, id DESC
+       LIMIT 100`
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   getDefaultAccount,
   upsertDefaultAccount,
@@ -164,4 +355,11 @@ module.exports = {
   listAppointments,
   getAvailabilitySettings,
   updateAvailabilitySettings,
+  getWheelSettings,
+  updateWheelSettings,
+  listWheelPrizes,
+  createWheelPrize,
+  updateWheelPrize,
+  deleteWheelPrize,
+  listWheelSpins,
 };
