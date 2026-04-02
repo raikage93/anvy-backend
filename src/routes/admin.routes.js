@@ -14,6 +14,8 @@ const {
   updateWheelPrize,
   deleteWheelPrize,
   listWheelSpins,
+  verifyWheelClaim,
+  redeemWheelClaim,
 } = require('../controllers/admin.controller');
 
 router.use(authenticate, requireAdmin);
@@ -30,6 +32,8 @@ router.post('/wheel-prizes', createWheelPrize);
 router.put('/wheel-prizes/:id', updateWheelPrize);
 router.delete('/wheel-prizes/:id', deleteWheelPrize);
 router.get('/wheel-spins', listWheelSpins);
+router.post('/wheel-claims/verify', verifyWheelClaim);
+router.post('/wheel-claims/redeem', redeemWheelClaim);
 router.patch('/change-password', changePassword);
 
 module.exports = router;

@@ -1,7 +1,43 @@
 const bcrypt = require('bcryptjs');
 const pool = require('../config/db');
 const { normalizeAvailabilityRow, timeToMinutes } = require('../utils/availability');
-const { normalizePrizeRow, isValidHexColor, normalizeWheelSettingsRow } = require('../utils/wheel');
+const {
+  normalizePrizeRow,
+  isValidHexColor,
+  normalizeWheelSettingsRow,
+  parseClaimQrPayload,
+  hashClaimToken,
+  normalizeClaimRow,
+  buildClaimQrPayload,
+} = require('../utils/wheel');
+
+async function findClaimByToken(clientOrPool, rawToken, options = {}) {
+  const claimToken = parseClaimQrPayload(rawToken);
+  if (!claimToken) {
+    return null;
+  }
+
+  const tokenHash = hashClaimToken(claimToken);
+  const lockClause = options.forUpdate ? 'FOR UPDATE OF wc' : '';
+  const result = await clientOrPool.query(
+    `SELECT wc.id, wc.spin_id, wc.prize_id, wc.phone, wc.prize_name, wc.prize_description, wc.prize_color,
+            wc.status, wc.issued_at, wc.redeemed_at, wc.redeemed_by, u.username AS redeemed_by_username
+     FROM wheel_claims wc
+     LEFT JOIN users u ON u.id = wc.redeemed_by
+     WHERE wc.claim_token_hash = $1
+     ${lockClause}`,
+    [tokenHash]
+  );
+
+  if (!result.rows[0]) {
+    return null;
+  }
+
+  return {
+    token: claimToken,
+    claim: normalizeClaimRow(result.rows[0]),
+  };
+}
 
 function validatePrizePayload(body) {
   const name = String(body.name || '').trim();
@@ -348,6 +384,71 @@ async function listWheelSpins(req, res, next) {
   }
 }
 
+async function verifyWheelClaim(req, res, next) {
+  try {
+    const { token } = req.body;
+    const found = await findClaimByToken(pool, token);
+
+    if (!found) {
+      return res.status(404).json({ error: 'QR không hợp lệ hoặc không tồn tại trong hệ thống.' });
+    }
+
+    res.json({
+      claim: found.claim,
+      qr_payload: buildClaimQrPayload(found.token),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function redeemWheelClaim(req, res, next) {
+  const client = await pool.connect();
+
+  try {
+    const { token } = req.body;
+    await client.query('BEGIN');
+
+    const found = await findClaimByToken(client, token, { forUpdate: true });
+    if (!found) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'QR không hợp lệ hoặc không tồn tại trong hệ thống.' });
+    }
+
+    if (found.claim.status === 'redeemed') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Mã QR này đã được xác nhận nhận quà trước đó.',
+        claim: found.claim,
+      });
+    }
+
+    const result = await client.query(
+      `UPDATE wheel_claims
+       SET status = 'redeemed',
+           redeemed_at = NOW(),
+           redeemed_by = $1
+       WHERE id = $2
+       RETURNING id, spin_id, prize_id, phone, prize_name, prize_description, prize_color, status, issued_at, redeemed_at, redeemed_by`,
+      [req.user.id, found.claim.id]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      claim: normalizeClaimRow({
+        ...result.rows[0],
+        redeemed_by_username: req.user.username,
+      }),
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    next(err);
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   getDefaultAccount,
   upsertDefaultAccount,
@@ -362,4 +463,6 @@ module.exports = {
   updateWheelPrize,
   deleteWheelPrize,
   listWheelSpins,
+  verifyWheelClaim,
+  redeemWheelClaim,
 };

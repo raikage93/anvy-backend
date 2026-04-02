@@ -6,6 +6,9 @@ const {
   normalizeWheelSettingsRow,
   normalizePhone,
   isValidPhone,
+  generateClaimToken,
+  hashClaimToken,
+  buildClaimQrPayload,
 } = require('../utils/wheel');
 
 async function getDefaultAccount(req, res, next) {
@@ -194,6 +197,23 @@ async function spinWheel(req, res, next) {
       [selectedPrize.id, selectedPrize.name, selectedPrize.description, selectedPrize.color, phone, spinDate]
     );
 
+    const claimToken = generateClaimToken();
+    const claimTokenHash = hashClaimToken(claimToken);
+    const claimResult = await client.query(
+      `INSERT INTO wheel_claims (spin_id, prize_id, phone, prize_name, prize_description, prize_color, claim_token_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, status, issued_at`,
+      [
+        Number(spinResult.rows[0].id),
+        selectedPrize.id,
+        phone,
+        selectedPrize.name,
+        selectedPrize.description,
+        selectedPrize.color,
+        claimTokenHash,
+      ]
+    );
+
     await client.query('COMMIT');
 
     const updatedPrizes = prizes.map((prize) =>
@@ -213,6 +233,13 @@ async function spinWheel(req, res, next) {
       spins_used_today: spinsUsedToday + 1,
       spins_remaining_today: Math.max(wheelSettings.max_daily_spins_per_phone - spinsUsedToday - 1, 0),
       phone,
+      claim: {
+        id: Number(claimResult.rows[0].id),
+        status: claimResult.rows[0].status,
+        issued_at: claimResult.rows[0].issued_at,
+        token: claimToken,
+        qr_payload: buildClaimQrPayload(claimToken),
+      },
     });
   } catch (err) {
     await client.query('ROLLBACK');

@@ -1,3 +1,5 @@
+const crypto = require('crypto');
+
 function normalizePrizeRow(row) {
   return {
     id: Number(row.id),
@@ -50,6 +52,48 @@ function isValidPhone(phone) {
   return /^[0-9+()\s.-]{8,20}$/.test(normalizePhone(phone));
 }
 
+function generateClaimToken() {
+  return crypto.randomBytes(24).toString('hex');
+}
+
+function hashClaimToken(token) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
+}
+
+function buildClaimQrPayload(token) {
+  return `ANVY_CLAIM:${token}`;
+}
+
+function parseClaimQrPayload(payload) {
+  const value = String(payload || '').trim();
+  if (!value) return '';
+  if (value.startsWith('ANVY_CLAIM:')) {
+    return value.slice('ANVY_CLAIM:'.length).trim();
+  }
+  return value;
+}
+
+function normalizeClaimRow(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: Number(row.id),
+    spin_id: Number(row.spin_id),
+    prize_id: row.prize_id != null ? Number(row.prize_id) : null,
+    phone: row.phone,
+    prize_name: row.prize_name,
+    prize_description: row.prize_description || '',
+    prize_color: row.prize_color || '#005eb8',
+    status: row.status,
+    issued_at: row.issued_at,
+    redeemed_at: row.redeemed_at,
+    redeemed_by: row.redeemed_by != null ? Number(row.redeemed_by) : null,
+    redeemed_by_username: row.redeemed_by_username || null,
+  };
+}
+
 module.exports = {
   normalizePrizeRow,
   isValidHexColor,
@@ -57,4 +101,9 @@ module.exports = {
   normalizeWheelSettingsRow,
   normalizePhone,
   isValidPhone,
+  generateClaimToken,
+  hashClaimToken,
+  buildClaimQrPayload,
+  parseClaimQrPayload,
+  normalizeClaimRow,
 };

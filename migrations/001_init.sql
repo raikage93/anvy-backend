@@ -84,3 +84,21 @@ CREATE TABLE IF NOT EXISTS wheel_settings (
 INSERT INTO wheel_settings (id, max_daily_spins_per_phone)
 VALUES (1, 1)
 ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS wheel_claims (
+  id SERIAL PRIMARY KEY,
+  spin_id INTEGER NOT NULL REFERENCES wheel_spins(id) ON DELETE CASCADE,
+  prize_id INTEGER REFERENCES wheel_prizes(id) ON DELETE SET NULL,
+  phone VARCHAR(20) NOT NULL,
+  prize_name VARCHAR(120) NOT NULL,
+  prize_description TEXT DEFAULT '',
+  prize_color VARCHAR(20) NOT NULL DEFAULT '#005eb8',
+  claim_token_hash VARCHAR(64) NOT NULL UNIQUE,
+  status VARCHAR(20) NOT NULL DEFAULT 'issued',
+  issued_at TIMESTAMP DEFAULT NOW(),
+  redeemed_at TIMESTAMP,
+  redeemed_by INTEGER REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wheel_claims_phone ON wheel_claims(phone);
+CREATE INDEX IF NOT EXISTS idx_wheel_claims_status ON wheel_claims(status);
