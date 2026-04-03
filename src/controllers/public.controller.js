@@ -114,6 +114,43 @@ async function getWheelSettings(req, res, next) {
   }
 }
 
+function maskPhone(phone) {
+  const raw = String(phone || '').trim();
+  if (!raw) {
+    return '';
+  }
+
+  const visibleStart = raw.slice(0, 3);
+  const visibleEnd = raw.slice(-3);
+  const hiddenLength = Math.max(raw.length - 6, 0);
+
+  return `${visibleStart}${'*'.repeat(hiddenLength)}${visibleEnd}`;
+}
+
+async function getRecentRedeemedWinners(req, res, next) {
+  try {
+    const result = await pool.query(
+      `SELECT id, phone, prize_name, prize_color, redeemed_at
+       FROM wheel_claims
+       WHERE status = 'redeemed'
+       ORDER BY redeemed_at DESC, id DESC
+       LIMIT 12`
+    );
+
+    res.json(
+      result.rows.map((row) => ({
+        id: Number(row.id),
+        phone: maskPhone(row.phone),
+        prize_name: row.prize_name,
+        prize_color: row.prize_color || '#005eb8',
+        redeemed_at: row.redeemed_at,
+      }))
+    );
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function spinWheel(req, res, next) {
   const client = await pool.connect();
 
@@ -249,4 +286,12 @@ async function spinWheel(req, res, next) {
   }
 }
 
-module.exports = { getDefaultAccount, createAppointment, getAvailability, getWheelPrizes, getWheelSettings, spinWheel };
+module.exports = {
+  getDefaultAccount,
+  createAppointment,
+  getAvailability,
+  getWheelPrizes,
+  getWheelSettings,
+  getRecentRedeemedWinners,
+  spinWheel,
+};
