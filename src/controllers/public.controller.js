@@ -127,6 +127,29 @@ function maskPhone(phone) {
   return `${visibleStart}${'*'.repeat(hiddenLength)}${visibleEnd}`;
 }
 
+function buildPublicClaim(claimRow) {
+  if (!claimRow) {
+    return null;
+  }
+
+  return {
+    id: Number(claimRow.id),
+    spin_id: Number(claimRow.spin_id),
+    prize_id: claimRow.prize_id != null ? Number(claimRow.prize_id) : null,
+    phone: claimRow.phone,
+    prize_name: claimRow.prize_name,
+    prize_description: claimRow.prize_description || '',
+    prize_color: claimRow.prize_color || '#005eb8',
+    status: claimRow.status,
+    issued_at: claimRow.issued_at,
+    redeemed_at: claimRow.redeemed_at,
+    redeemed_by: claimRow.redeemed_by != null ? Number(claimRow.redeemed_by) : null,
+    redeemed_by_username: claimRow.redeemed_by_username || null,
+    token: claimRow.claim_token || undefined,
+    qr_payload: claimRow.claim_token ? buildClaimQrPayload(claimRow.claim_token) : undefined,
+  };
+}
+
 async function getRecentRedeemedWinners(req, res, next) {
   try {
     const result = await pool.query(
@@ -144,6 +167,62 @@ async function getRecentRedeemedWinners(req, res, next) {
         prize_name: row.prize_name,
         prize_color: row.prize_color || '#005eb8',
         redeemed_at: row.redeemed_at,
+      }))
+    );
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getMyWheelRewards(req, res, next) {
+  try {
+    const phone = normalizePhone(req.query.phone);
+
+    if (!isValidPhone(phone)) {
+      return res.status(400).json({ error: 'Số điện thoại không hợp lệ.' });
+    }
+
+    const todayResult = await pool.query(
+      `SELECT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Ho_Chi_Minh')::date AS spin_date`
+    );
+    const spinDate = todayResult.rows[0].spin_date;
+
+    const result = await pool.query(
+      `SELECT ws.id, ws.prize_id, ws.prize_name, ws.prize_description, ws.prize_color, ws.phone, ws.spin_date, ws.created_at,
+              wc.id AS claim_id, wc.status AS claim_status, wc.issued_at, wc.redeemed_at, wc.redeemed_by, wc.claim_token
+       FROM wheel_spins ws
+       LEFT JOIN wheel_claims wc ON wc.spin_id = ws.id
+       WHERE ws.phone = $1 AND ws.spin_date = $2
+       ORDER BY ws.created_at DESC, ws.id DESC`,
+      [phone, spinDate]
+    );
+
+    res.json(
+      result.rows.map((row) => ({
+        id: Number(row.id),
+        prize_id: row.prize_id != null ? Number(row.prize_id) : null,
+        prize_name: row.prize_name,
+        prize_description: row.prize_description || '',
+        prize_color: row.prize_color || '#005eb8',
+        phone: row.phone,
+        spin_date: row.spin_date,
+        created_at: row.created_at,
+        claim: row.claim_id
+          ? buildPublicClaim({
+              id: row.claim_id,
+              spin_id: row.id,
+              prize_id: row.prize_id,
+              phone: row.phone,
+              prize_name: row.prize_name,
+              prize_description: row.prize_description,
+              prize_color: row.prize_color,
+              status: row.claim_status,
+              issued_at: row.issued_at,
+              redeemed_at: row.redeemed_at,
+              redeemed_by: row.redeemed_by,
+              claim_token: row.claim_token,
+            })
+          : null,
       }))
     );
   } catch (err) {
@@ -234,23 +313,6 @@ async function spinWheel(req, res, next) {
       [selectedPrize.id, selectedPrize.name, selectedPrize.description, selectedPrize.color, phone, spinDate]
     );
 
-    const claimToken = generateClaimToken();
-    const claimTokenHash = hashClaimToken(claimToken);
-    const claimResult = await client.query(
-      `INSERT INTO wheel_claims (spin_id, prize_id, phone, prize_name, prize_description, prize_color, claim_token_hash)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, status, issued_at`,
-      [
-        Number(spinResult.rows[0].id),
-        selectedPrize.id,
-        phone,
-        selectedPrize.name,
-        selectedPrize.description,
-        selectedPrize.color,
-        claimTokenHash,
-      ]
-    );
-
     await client.query('COMMIT');
 
     const updatedPrizes = prizes.map((prize) =>
@@ -270,13 +332,116 @@ async function spinWheel(req, res, next) {
       spins_used_today: spinsUsedToday + 1,
       spins_remaining_today: Math.max(wheelSettings.max_daily_spins_per_phone - spinsUsedToday - 1, 0),
       phone,
-      claim: {
-        id: Number(claimResult.rows[0].id),
-        status: claimResult.rows[0].status,
-        issued_at: claimResult.rows[0].issued_at,
-        token: claimToken,
-        qr_payload: buildClaimQrPayload(claimToken),
-      },
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    next(err);
+  } finally {
+    client.release();
+  }
+}
+
+async function claimWheelPrize(req, res, next) {
+  const client = await pool.connect();
+
+  try {
+    const phone = normalizePhone(req.body.phone);
+    const spinId = Number(req.body.spin_id);
+
+    if (!isValidPhone(phone)) {
+      return res.status(400).json({ error: 'Số điện thoại không hợp lệ.' });
+    }
+
+    if (!Number.isInteger(spinId) || spinId <= 0) {
+      return res.status(400).json({ error: 'Lượt quay không hợp lệ.' });
+    }
+
+    await client.query('BEGIN');
+
+    const todayResult = await client.query(
+      `SELECT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Ho_Chi_Minh')::date AS spin_date`
+    );
+    const claimDate = todayResult.rows[0].spin_date;
+
+    const existingForSpinResult = await client.query(
+      `SELECT wc.id, wc.spin_id, wc.prize_id, wc.phone, wc.prize_name, wc.prize_description, wc.prize_color,
+              wc.status, wc.issued_at, wc.redeemed_at, wc.redeemed_by, wc.claim_token
+       FROM wheel_claims wc
+       WHERE wc.spin_id = $1
+       FOR UPDATE`,
+      [spinId]
+    );
+
+    if (existingForSpinResult.rows[0]) {
+      await client.query('COMMIT');
+      return res.json({
+        claim: buildPublicClaim(existingForSpinResult.rows[0]),
+      });
+    }
+
+    const existingDailyClaimResult = await client.query(
+      `SELECT wc.id, wc.spin_id, wc.prize_id, wc.phone, wc.prize_name, wc.prize_description, wc.prize_color,
+              wc.status, wc.issued_at, wc.redeemed_at, wc.redeemed_by, wc.claim_token
+       FROM wheel_claims wc
+       WHERE wc.phone = $1 AND wc.claim_date = $2
+       ORDER BY wc.issued_at DESC, wc.id DESC
+       LIMIT 1
+       FOR UPDATE`,
+      [phone, claimDate]
+    );
+
+    if (existingDailyClaimResult.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Mỗi số điện thoại chỉ có thể nhận 1 giải mỗi ngày.',
+        claim: buildPublicClaim(existingDailyClaimResult.rows[0]),
+      });
+    }
+
+    const spinResult = await client.query(
+      `SELECT id, prize_id, prize_name, prize_description, prize_color, phone, spin_date, created_at
+       FROM wheel_spins
+       WHERE id = $1 AND phone = $2
+       FOR UPDATE`,
+      [spinId, phone]
+    );
+
+    const spinRow = spinResult.rows[0];
+    if (!spinRow) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Không tìm thấy lượt quay tương ứng với số điện thoại này.' });
+    }
+
+    if (String(spinRow.spin_date) !== String(claimDate)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Chỉ có thể nhận giải từ các lượt quay trong ngày hôm nay.' });
+    }
+
+    const claimToken = generateClaimToken();
+    const claimTokenHash = hashClaimToken(claimToken);
+    const claimInsertResult = await client.query(
+      `INSERT INTO wheel_claims (
+          spin_id, prize_id, phone, prize_name, prize_description, prize_color, claim_token, claim_token_hash, claim_date
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id, spin_id, prize_id, phone, prize_name, prize_description, prize_color, status, issued_at, redeemed_at, redeemed_by, claim_token`,
+      [
+        Number(spinRow.id),
+        spinRow.prize_id,
+        phone,
+        spinRow.prize_name,
+        spinRow.prize_description,
+        spinRow.prize_color,
+        claimToken,
+        claimTokenHash,
+        claimDate,
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    res.status(201).json({
+      claim: buildPublicClaim(claimInsertResult.rows[0]),
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -293,5 +458,7 @@ module.exports = {
   getWheelPrizes,
   getWheelSettings,
   getRecentRedeemedWinners,
+  getMyWheelRewards,
+  claimWheelPrize,
   spinWheel,
 };

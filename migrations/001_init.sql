@@ -93,12 +93,23 @@ CREATE TABLE IF NOT EXISTS wheel_claims (
   prize_name VARCHAR(120) NOT NULL,
   prize_description TEXT DEFAULT '',
   prize_color VARCHAR(20) NOT NULL DEFAULT '#005eb8',
+  claim_token VARCHAR(64),
   claim_token_hash VARCHAR(64) NOT NULL UNIQUE,
+  claim_date DATE,
   status VARCHAR(20) NOT NULL DEFAULT 'issued',
   issued_at TIMESTAMP DEFAULT NOW(),
   redeemed_at TIMESTAMP,
   redeemed_by INTEGER REFERENCES users(id)
 );
 
+ALTER TABLE wheel_claims
+  ADD COLUMN IF NOT EXISTS claim_token VARCHAR(64),
+  ADD COLUMN IF NOT EXISTS claim_date DATE;
+
+UPDATE wheel_claims
+SET claim_date = COALESCE(claim_date, (issued_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date)
+WHERE claim_date IS NULL;
+
 CREATE INDEX IF NOT EXISTS idx_wheel_claims_phone ON wheel_claims(phone);
 CREATE INDEX IF NOT EXISTS idx_wheel_claims_status ON wheel_claims(status);
+CREATE INDEX IF NOT EXISTS idx_wheel_claims_phone_claim_date ON wheel_claims(phone, claim_date);
