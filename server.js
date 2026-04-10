@@ -7,6 +7,7 @@ const { ensureSchema } = require('./src/config/ensureSchema');
 const authRoutes = require('./src/routes/auth.routes');
 const adminRoutes = require('./src/routes/admin.routes');
 const publicRoutes = require('./src/routes/public.routes');
+const internalRoutes = require('./src/routes/internal.routes');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -19,6 +20,7 @@ app.use('/api/uploads', express.static(path.join(__dirname, 'uploads')));
 // Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/internal', internalRoutes);
 app.use('/api', publicRoutes);
 
 // Health check
