@@ -13,9 +13,11 @@ const {
   claimWheelPrize,
   spinWheel,
 } = require('../controllers/public.controller');
+const { handleTelegramWebhook } = require('../controllers/telegram.controller');
 
 router.get('/default-account', getDefaultAccount);
 router.get('/availability', getAvailability);
+router.post('/telegram/webhook', handleTelegramWebhook);
 router.get('/eyewear-products/search', searchEyewearProducts);
 router.get('/eyewear-products', getEyewearProducts);
 router.get('/patient-records', getPatientRecordsByPhone);
