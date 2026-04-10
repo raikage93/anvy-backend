@@ -113,3 +113,25 @@ WHERE claim_date IS NULL;
 CREATE INDEX IF NOT EXISTS idx_wheel_claims_phone ON wheel_claims(phone);
 CREATE INDEX IF NOT EXISTS idx_wheel_claims_status ON wheel_claims(status);
 CREATE INDEX IF NOT EXISTS idx_wheel_claims_phone_claim_date ON wheel_claims(phone, claim_date);
+
+CREATE TABLE IF NOT EXISTS eyewear_products (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(160) NOT NULL,
+  brand VARCHAR(120) NOT NULL DEFAULT 'Khác',
+  frame_type VARCHAR(120) NOT NULL DEFAULT 'Khác',
+  price NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (price >= 0),
+  description TEXT DEFAULT '',
+  image_url TEXT NOT NULL,
+  quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_eyewear_products_active_sort ON eyewear_products(is_active, sort_order, id);
+
+ALTER TABLE eyewear_products
+  ADD COLUMN IF NOT EXISTS brand VARCHAR(120) NOT NULL DEFAULT 'Khác',
+  ADD COLUMN IF NOT EXISTS frame_type VARCHAR(120) NOT NULL DEFAULT 'Khác',
+  ADD COLUMN IF NOT EXISTS price NUMERIC(12, 2) NOT NULL DEFAULT 0;

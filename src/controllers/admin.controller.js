@@ -10,6 +10,11 @@ const {
   normalizeClaimRow,
   buildClaimQrPayload,
 } = require('../utils/wheel');
+const {
+  indexProduct: indexEyewearProductInSearch,
+  removeProduct: removeEyewearProductFromSearch,
+  bulkReindex: bulkReindexEyewearProductsInSearch,
+} = require('../services/eyewearSearch.service');
 
 async function findClaimByToken(clientOrPool, rawToken, options = {}) {
   const claimToken = parseClaimQrPayload(rawToken);
@@ -79,6 +84,78 @@ function validatePrizePayload(body) {
       color,
       totalQuantity,
       remainingQuantity,
+      sortOrder,
+      isActive,
+    },
+  };
+}
+
+function normalizeEyewearProductRow(row) {
+  return {
+    id: Number(row.id),
+    name: row.name,
+    brand: row.brand || 'Khác',
+    frame_type: row.frame_type || 'Khác',
+    price: Number(row.price || 0),
+    description: row.description || '',
+    image_url: row.image_url,
+    quantity: Number(row.quantity || 0),
+    is_active: row.is_active !== false,
+    sort_order: Number(row.sort_order || 0),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+function validateEyewearPayload(body, options = {}) {
+  const { imageUrlRequired = true } = options;
+  const name = String(body.name || '').trim();
+  const brand = String(body.brand || '').trim();
+  const frameType = String(body.frame_type || '').trim();
+  const price = Number(body.price);
+  const description = String(body.description || '').trim();
+  const imageUrl = String(body.image_url || '').trim();
+  const quantity = Number(body.quantity);
+  const sortOrder = Number(body.sort_order || 0);
+  const isActive = String(body.is_active).toLowerCase() !== 'false';
+
+  if (!name) {
+    return { error: 'Vui lòng nhập tên sản phẩm.' };
+  }
+
+  if (!brand) {
+    return { error: 'Vui lòng nhập brand.' };
+  }
+
+  if (!frameType) {
+    return { error: 'Vui lòng nhập loại gọng.' };
+  }
+
+  if (!Number.isFinite(price) || price < 0) {
+    return { error: 'Giá sản phẩm không hợp lệ.' };
+  }
+
+  if (imageUrlRequired && !imageUrl) {
+    return { error: 'Vui lòng nhập ảnh sản phẩm.' };
+  }
+
+  if (!Number.isInteger(quantity) || quantity < 0) {
+    return { error: 'Số lượng phải là số nguyên không âm.' };
+  }
+
+  if (!Number.isInteger(sortOrder)) {
+    return { error: 'Thứ tự hiển thị không hợp lệ.' };
+  }
+
+  return {
+    value: {
+      name,
+      brand,
+      frameType,
+      price,
+      description,
+      imageUrl,
+      quantity,
       sortOrder,
       isActive,
     },
@@ -384,6 +461,143 @@ async function listWheelSpins(req, res, next) {
   }
 }
 
+async function listEyewearProducts(req, res, next) {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, brand, frame_type, price, description, image_url, quantity, is_active, sort_order, created_at, updated_at
+       FROM eyewear_products
+       ORDER BY is_active DESC, sort_order ASC, id ASC`
+    );
+
+    res.json(result.rows.map(normalizeEyewearProductRow));
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function createEyewearProduct(req, res, next) {
+  try {
+    const imageUrl = req.file ? `/api/uploads/${req.file.filename}` : String(req.body.image_url || '').trim();
+    const validation = validateEyewearPayload(
+      {
+        ...req.body,
+        image_url: imageUrl,
+      },
+      { imageUrlRequired: true }
+    );
+    if (validation.error) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const { name, brand, frameType, price, description, imageUrl: savedImageUrl, quantity, sortOrder, isActive } = validation.value;
+    const result = await pool.query(
+      `INSERT INTO eyewear_products (name, brand, frame_type, price, description, image_url, quantity, is_active, sort_order, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+       RETURNING id, name, brand, frame_type, price, description, image_url, quantity, is_active, sort_order, created_at, updated_at`,
+      [name, brand, frameType, price, description, savedImageUrl, quantity, isActive, sortOrder]
+    );
+
+    const product = normalizeEyewearProductRow(result.rows[0]);
+    res.status(201).json(product);
+    indexEyewearProductInSearch(product).catch((error) => {
+      console.error('❌ Failed to sync eyewear product to Elasticsearch:', error.message);
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function updateEyewearProduct(req, res, next) {
+  try {
+    const productId = Number(req.params.id);
+    if (!Number.isInteger(productId) || productId <= 0) {
+      return res.status(400).json({ error: 'Sản phẩm không hợp lệ.' });
+    }
+
+    const existingResult = await pool.query('SELECT image_url FROM eyewear_products WHERE id = $1', [productId]);
+    if (!existingResult.rows[0]) {
+      return res.status(404).json({ error: 'Không tìm thấy sản phẩm.' });
+    }
+
+    const imageUrl = req.file
+      ? `/api/uploads/${req.file.filename}`
+      : String(req.body.image_url || existingResult.rows[0].image_url || '').trim();
+
+    const validation = validateEyewearPayload(
+      {
+        ...req.body,
+        image_url: imageUrl,
+      },
+      { imageUrlRequired: true }
+    );
+    if (validation.error) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const { name, brand, frameType, price, description, imageUrl: savedImageUrl, quantity, sortOrder, isActive } = validation.value;
+    const result = await pool.query(
+      `UPDATE eyewear_products
+       SET name = $1,
+           brand = $2,
+           frame_type = $3,
+           price = $4,
+           description = $5,
+           image_url = $6,
+           quantity = $7,
+           is_active = $8,
+           sort_order = $9,
+           updated_at = NOW()
+       WHERE id = $10
+       RETURNING id, name, brand, frame_type, price, description, image_url, quantity, is_active, sort_order, created_at, updated_at`,
+      [name, brand, frameType, price, description, savedImageUrl, quantity, isActive, sortOrder, productId]
+    );
+
+    const product = normalizeEyewearProductRow(result.rows[0]);
+    res.json(product);
+    indexEyewearProductInSearch(product).catch((error) => {
+      console.error('❌ Failed to sync eyewear product to Elasticsearch:', error.message);
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function deleteEyewearProduct(req, res, next) {
+  try {
+    const productId = Number(req.params.id);
+    if (!Number.isInteger(productId) || productId <= 0) {
+      return res.status(400).json({ error: 'Sản phẩm không hợp lệ.' });
+    }
+
+    const result = await pool.query('DELETE FROM eyewear_products WHERE id = $1 RETURNING id', [productId]);
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: 'Không tìm thấy sản phẩm.' });
+    }
+
+    res.json({ success: true });
+    removeEyewearProductFromSearch(productId).catch((error) => {
+      console.error('❌ Failed to remove eyewear product from Elasticsearch:', error.message);
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function reindexEyewearProducts(req, res, next) {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, brand, frame_type, price, description, image_url, quantity, is_active, sort_order, created_at, updated_at
+       FROM eyewear_products`
+    );
+
+    const products = result.rows.map(normalizeEyewearProductRow);
+    await bulkReindexEyewearProductsInSearch(products);
+    res.json({ success: true, total: products.length });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function verifyWheelClaim(req, res, next) {
   try {
     const { token } = req.body;
@@ -397,6 +611,624 @@ async function verifyWheelClaim(req, res, next) {
       claim: found.claim,
       qr_payload: buildClaimQrPayload(found.token),
     });
+  } catch (err) {
+    next(err);
+  }
+}
+
+function normalizePatientProfileRow(row, results = undefined) {
+  if (!row) return null;
+  const value = {
+    id: Number(row.id),
+    full_name: row.full_name,
+    birth_year: row.birth_year === null || row.birth_year === undefined ? null : Number(row.birth_year),
+    phone: row.phone || '',
+    phone_digits: row.phone_digits || '',
+    address: row.address || '',
+    latest_exam_date:
+      row.latest_exam_date instanceof Date
+        ? row.latest_exam_date.toISOString().slice(0, 10)
+        : row.latest_exam_date
+          ? String(row.latest_exam_date).slice(0, 10)
+          : null,
+    result_count: row.result_count === null || row.result_count === undefined ? 0 : Number(row.result_count),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    created_by: row.created_by === null || row.created_by === undefined ? null : Number(row.created_by),
+  };
+
+  if (results) {
+    return { ...value, results };
+  }
+
+  return value;
+}
+
+function normalizePatientExamResultRow(row) {
+  if (!row) return null;
+  const num = (v) => (v === null || v === undefined ? null : Number(v));
+  return {
+    id: Number(row.id),
+    patient_profile_id: Number(row.patient_profile_id),
+    exam_date:
+      row.exam_date instanceof Date
+        ? row.exam_date.toISOString().slice(0, 10)
+        : String(row.exam_date).slice(0, 10),
+    quick_medical_assessment: row.quick_medical_assessment || '',
+    va_unaided_mp: row.va_unaided_mp || '',
+    va_unaided_mt: row.va_unaided_mt || '',
+    va_unaided_binocular: row.va_unaided_binocular || '',
+    va_old_mp: row.va_old_mp || '',
+    va_old_mt: row.va_old_mt || '',
+    va_old_binocular: row.va_old_binocular || '',
+    va_new_mp: row.va_new_mp || '',
+    va_new_mt: row.va_new_mt || '',
+    va_new_binocular: row.va_new_binocular || '',
+    sphere_old_mp: num(row.sphere_old_mp),
+    cylinder_old_mp: num(row.cylinder_old_mp),
+    axis_old_mp: row.axis_old_mp === null || row.axis_old_mp === undefined ? null : Number(row.axis_old_mp),
+    sphere_old_mt: num(row.sphere_old_mt),
+    cylinder_old_mt: num(row.cylinder_old_mt),
+    axis_old_mt: row.axis_old_mt === null || row.axis_old_mt === undefined ? null : Number(row.axis_old_mt),
+    sphere_new_mp: num(row.sphere_new_mp),
+    cylinder_new_mp: num(row.cylinder_new_mp),
+    axis_new_mp: row.axis_new_mp === null || row.axis_new_mp === undefined ? null : Number(row.axis_new_mp),
+    sphere_new_mt: num(row.sphere_new_mt),
+    cylinder_new_mt: num(row.cylinder_new_mt),
+    axis_new_mt: row.axis_new_mt === null || row.axis_new_mt === undefined ? null : Number(row.axis_new_mt),
+    next_appointment_date:
+      row.next_appointment_date instanceof Date
+        ? row.next_appointment_date.toISOString().slice(0, 10)
+        : row.next_appointment_date
+          ? String(row.next_appointment_date).slice(0, 10)
+          : null,
+    clinical_diagnosis: row.clinical_diagnosis || '',
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    created_by: row.created_by === null || row.created_by === undefined ? null : Number(row.created_by),
+  };
+}
+
+function normalizePhoneDigits(value) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+function parseOptionalNumber(value) {
+  if (value === '' || value === null || value === undefined) {
+    return null;
+  }
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseOptionalInt(value) {
+  if (value === '' || value === null || value === undefined) {
+    return null;
+  }
+  const n = parseInt(String(value), 10);
+  return Number.isInteger(n) ? n : null;
+}
+
+function validatePatientProfilePayload(body) {
+  const fullName = String(body.full_name || '').trim();
+  const phone = String(body.phone || '').trim();
+  const phoneDigits = normalizePhoneDigits(phone);
+
+  if (!fullName) {
+    return { error: 'Vui lòng nhập họ tên bệnh nhân.' };
+  }
+
+  if (phoneDigits.length < 8 || phoneDigits.length > 20) {
+    return { error: 'Mỗi hồ sơ cần một số điện thoại hợp lệ và duy nhất.' };
+  }
+
+  const birthYear = parseOptionalInt(body.birth_year);
+  if (birthYear !== null && (birthYear < 1900 || birthYear > 2100)) {
+    return { error: 'Năm sinh không hợp lệ.' };
+  }
+
+  return {
+    value: {
+      full_name: fullName,
+      birth_year: birthYear,
+      phone,
+      phone_digits: phoneDigits,
+      address: String(body.address ?? '').trim(),
+    },
+  };
+}
+
+function validatePatientExamResultPayload(body) {
+  const examDateRaw = String(body.exam_date || '').trim();
+  const nextAppointmentDateRaw = String(body.next_appointment_date || '').trim();
+
+  if (!examDateRaw) {
+    return { error: 'Vui lòng nhập ngày khám.' };
+  }
+
+  const examDateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(examDateRaw);
+  if (!examDateMatch) {
+    return { error: 'Ngày khám không hợp lệ (dùng định dạng YYYY-MM-DD).' };
+  }
+
+  let nextAppointmentDate = null;
+  if (nextAppointmentDateRaw) {
+    const nextMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(nextAppointmentDateRaw);
+    if (!nextMatch) {
+      return { error: 'Ngày hẹn khám tiếp theo không hợp lệ (dùng định dạng YYYY-MM-DD).' };
+    }
+    nextAppointmentDate = nextAppointmentDateRaw;
+  }
+
+  const str = (k) => String(body[k] ?? '').trim();
+
+  const axisKeys = [
+    'axis_old_mp',
+    'axis_old_mt',
+    'axis_new_mp',
+    'axis_new_mt',
+  ];
+  for (const key of axisKeys) {
+    const ax = parseOptionalInt(body[key]);
+    if (ax !== null && (ax < 0 || ax > 180)) {
+      return { error: 'Trục (axis) phải từ 0 đến 180.' };
+    }
+  }
+
+  return {
+    value: {
+      exam_date: examDateRaw,
+      quick_medical_assessment: str('quick_medical_assessment'),
+      va_unaided_mp: str('va_unaided_mp'),
+      va_unaided_mt: str('va_unaided_mt'),
+      va_unaided_binocular: str('va_unaided_binocular'),
+      va_old_mp: str('va_old_mp'),
+      va_old_mt: str('va_old_mt'),
+      va_old_binocular: str('va_old_binocular'),
+      va_new_mp: str('va_new_mp'),
+      va_new_mt: str('va_new_mt'),
+      va_new_binocular: str('va_new_binocular'),
+      sphere_old_mp: parseOptionalNumber(body.sphere_old_mp),
+      cylinder_old_mp: parseOptionalNumber(body.cylinder_old_mp),
+      axis_old_mp: parseOptionalInt(body.axis_old_mp),
+      sphere_old_mt: parseOptionalNumber(body.sphere_old_mt),
+      cylinder_old_mt: parseOptionalNumber(body.cylinder_old_mt),
+      axis_old_mt: parseOptionalInt(body.axis_old_mt),
+      sphere_new_mp: parseOptionalNumber(body.sphere_new_mp),
+      cylinder_new_mp: parseOptionalNumber(body.cylinder_new_mp),
+      axis_new_mp: parseOptionalInt(body.axis_new_mp),
+      sphere_new_mt: parseOptionalNumber(body.sphere_new_mt),
+      cylinder_new_mt: parseOptionalNumber(body.cylinder_new_mt),
+      axis_new_mt: parseOptionalInt(body.axis_new_mt),
+      next_appointment_date: nextAppointmentDate,
+      clinical_diagnosis: str('clinical_diagnosis'),
+    },
+  };
+}
+
+function validatePatientRecordPayload(body) {
+  const profile = validatePatientProfilePayload(body);
+  if (profile.error) return profile;
+
+  const result = validatePatientExamResultPayload(body);
+  if (result.error) return result;
+
+  return {
+    value: {
+      ...profile.value,
+      ...result.value,
+    },
+  };
+}
+
+async function getPatientProfileWithResults(profileId, client = pool) {
+  const profileResult = await client.query(
+    `SELECT p.*,
+            MAX(r.exam_date) AS latest_exam_date,
+            COUNT(r.id)::int AS result_count
+     FROM patient_profiles p
+     LEFT JOIN patient_exam_results r ON r.patient_profile_id = p.id
+     WHERE p.id = $1
+     GROUP BY p.id`,
+    [profileId]
+  );
+
+  if (!profileResult.rows[0]) {
+    return null;
+  }
+
+  const resultsResult = await client.query(
+    `SELECT *
+     FROM patient_exam_results
+     WHERE patient_profile_id = $1
+     ORDER BY exam_date DESC, id DESC`,
+    [profileId]
+  );
+
+  return normalizePatientProfileRow(
+    profileResult.rows[0],
+    resultsResult.rows.map(normalizePatientExamResultRow)
+  );
+}
+
+async function listPatientRecords(req, res, next) {
+  try {
+    const q = String(req.query.q || '').trim();
+    const phoneDigits = normalizePhoneDigits(q);
+    const pattern = `%${q}%`;
+    const phonePattern = `%${phoneDigits}%`;
+    const values = q ? [pattern, phonePattern, q] : [];
+    const whereClause = q
+      ? `WHERE p.full_name ILIKE $1 OR p.phone ILIKE $1 OR p.phone_digits LIKE $2 OR CAST(p.id AS TEXT) = $3`
+      : '';
+
+    const result = await pool.query(
+      `SELECT p.*,
+              MAX(r.exam_date) AS latest_exam_date,
+              COUNT(r.id)::int AS result_count
+       FROM patient_profiles p
+       LEFT JOIN patient_exam_results r ON r.patient_profile_id = p.id
+       ${whereClause}
+       GROUP BY p.id
+       ORDER BY MAX(r.exam_date) DESC NULLS LAST, p.updated_at DESC, p.id DESC
+       LIMIT 200`,
+      values
+    );
+
+    res.json(result.rows.map((row) => normalizePatientProfileRow(row)));
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getPatientRecord(req, res, next) {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'Hồ sơ không hợp lệ.' });
+    }
+
+    const profile = await getPatientProfileWithResults(id);
+    if (!profile) {
+      return res.status(404).json({ error: 'Không tìm thấy hồ sơ.' });
+    }
+
+    res.json(profile);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function createPatientRecord(req, res, next) {
+  const client = await pool.connect();
+
+  try {
+    const validation = validatePatientRecordPayload(req.body);
+    if (validation.error) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const v = validation.value;
+
+    await client.query('BEGIN');
+
+    const profileResult = await client.query(
+      `INSERT INTO patient_profiles (full_name, birth_year, phone, phone_digits, address, created_by, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       ON CONFLICT (phone_digits) DO UPDATE SET
+         full_name = EXCLUDED.full_name,
+         birth_year = EXCLUDED.birth_year,
+         phone = EXCLUDED.phone,
+         address = EXCLUDED.address,
+         updated_at = NOW()
+       RETURNING *`,
+      [v.full_name, v.birth_year, v.phone, v.phone_digits, v.address, req.user.id]
+    );
+
+    const profileId = Number(profileResult.rows[0].id);
+    await client.query(
+      `INSERT INTO patient_exam_results (
+        patient_profile_id, exam_date, quick_medical_assessment,
+        va_unaided_mp, va_unaided_mt, va_unaided_binocular,
+        va_old_mp, va_old_mt, va_old_binocular, va_new_mp, va_new_mt, va_new_binocular,
+        sphere_old_mp, cylinder_old_mp, axis_old_mp, sphere_old_mt, cylinder_old_mt, axis_old_mt,
+        sphere_new_mp, cylinder_new_mp, axis_new_mp, sphere_new_mt, cylinder_new_mt, axis_new_mt,
+        next_appointment_date, clinical_diagnosis, created_by, updated_at
+      ) VALUES (
+        $1, $2, $3,
+        $4, $5, $6,
+        $7, $8, $9, $10, $11, $12,
+        $13, $14, $15, $16, $17, $18,
+        $19, $20, $21, $22, $23, $24,
+        $25, $26, $27, NOW()
+      )
+      ON CONFLICT (patient_profile_id, exam_date) DO UPDATE SET
+        quick_medical_assessment = EXCLUDED.quick_medical_assessment,
+        va_unaided_mp = EXCLUDED.va_unaided_mp,
+        va_unaided_mt = EXCLUDED.va_unaided_mt,
+        va_unaided_binocular = EXCLUDED.va_unaided_binocular,
+        va_old_mp = EXCLUDED.va_old_mp,
+        va_old_mt = EXCLUDED.va_old_mt,
+        va_old_binocular = EXCLUDED.va_old_binocular,
+        va_new_mp = EXCLUDED.va_new_mp,
+        va_new_mt = EXCLUDED.va_new_mt,
+        va_new_binocular = EXCLUDED.va_new_binocular,
+        sphere_old_mp = EXCLUDED.sphere_old_mp,
+        cylinder_old_mp = EXCLUDED.cylinder_old_mp,
+        axis_old_mp = EXCLUDED.axis_old_mp,
+        sphere_old_mt = EXCLUDED.sphere_old_mt,
+        cylinder_old_mt = EXCLUDED.cylinder_old_mt,
+        axis_old_mt = EXCLUDED.axis_old_mt,
+        sphere_new_mp = EXCLUDED.sphere_new_mp,
+        cylinder_new_mp = EXCLUDED.cylinder_new_mp,
+        axis_new_mp = EXCLUDED.axis_new_mp,
+        sphere_new_mt = EXCLUDED.sphere_new_mt,
+        cylinder_new_mt = EXCLUDED.cylinder_new_mt,
+        axis_new_mt = EXCLUDED.axis_new_mt,
+        next_appointment_date = EXCLUDED.next_appointment_date,
+        clinical_diagnosis = EXCLUDED.clinical_diagnosis,
+        updated_at = NOW()`,
+      [
+        profileId,
+        v.exam_date,
+        v.quick_medical_assessment,
+        v.va_unaided_mp,
+        v.va_unaided_mt,
+        v.va_unaided_binocular,
+        v.va_old_mp,
+        v.va_old_mt,
+        v.va_old_binocular,
+        v.va_new_mp,
+        v.va_new_mt,
+        v.va_new_binocular,
+        v.sphere_old_mp,
+        v.cylinder_old_mp,
+        v.axis_old_mp,
+        v.sphere_old_mt,
+        v.cylinder_old_mt,
+        v.axis_old_mt,
+        v.sphere_new_mp,
+        v.cylinder_new_mp,
+        v.axis_new_mp,
+        v.sphere_new_mt,
+        v.cylinder_new_mt,
+        v.axis_new_mt,
+        v.next_appointment_date,
+        v.clinical_diagnosis,
+        req.user.id,
+      ]
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json(await getPatientProfileWithResults(profileId));
+  } catch (err) {
+    await client.query('ROLLBACK');
+    next(err);
+  } finally {
+    client.release();
+  }
+}
+
+async function updatePatientRecord(req, res, next) {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'Hồ sơ không hợp lệ.' });
+    }
+
+    const validation = validatePatientProfilePayload(req.body);
+    if (validation.error) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const v = validation.value;
+    const result = await pool.query(
+      `UPDATE patient_profiles SET
+        full_name = $1,
+        birth_year = $2,
+        phone = $3,
+        phone_digits = $4,
+        address = $5,
+        updated_at = NOW()
+      WHERE id = $6
+      RETURNING *`,
+      [v.full_name, v.birth_year, v.phone, v.phone_digits, v.address, id]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: 'Không tìm thấy hồ sơ.' });
+    }
+
+    res.json(await getPatientProfileWithResults(id));
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'Số điện thoại này đã thuộc về một hồ sơ khác.' });
+    }
+    next(err);
+  }
+}
+
+async function createPatientExamResult(req, res, next) {
+  try {
+    const profileId = Number(req.params.id);
+    if (!Number.isInteger(profileId) || profileId <= 0) {
+      return res.status(400).json({ error: 'Hồ sơ không hợp lệ.' });
+    }
+
+    const validation = validatePatientExamResultPayload(req.body);
+    if (validation.error) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const v = validation.value;
+    const result = await pool.query(
+      `INSERT INTO patient_exam_results (
+        patient_profile_id, exam_date, quick_medical_assessment,
+        va_unaided_mp, va_unaided_mt, va_unaided_binocular,
+        va_old_mp, va_old_mt, va_old_binocular, va_new_mp, va_new_mt, va_new_binocular,
+        sphere_old_mp, cylinder_old_mp, axis_old_mp, sphere_old_mt, cylinder_old_mt, axis_old_mt,
+        sphere_new_mp, cylinder_new_mp, axis_new_mp, sphere_new_mt, cylinder_new_mt, axis_new_mt,
+        next_appointment_date, clinical_diagnosis, created_by, updated_at
+      ) VALUES (
+        $1, $2, $3,
+        $4, $5, $6,
+        $7, $8, $9, $10, $11, $12,
+        $13, $14, $15, $16, $17, $18,
+        $19, $20, $21, $22, $23, $24,
+        $25, $26, $27, NOW()
+      )
+      RETURNING *`,
+      [
+        profileId,
+        v.exam_date,
+        v.quick_medical_assessment,
+        v.va_unaided_mp,
+        v.va_unaided_mt,
+        v.va_unaided_binocular,
+        v.va_old_mp,
+        v.va_old_mt,
+        v.va_old_binocular,
+        v.va_new_mp,
+        v.va_new_mt,
+        v.va_new_binocular,
+        v.sphere_old_mp,
+        v.cylinder_old_mp,
+        v.axis_old_mp,
+        v.sphere_old_mt,
+        v.cylinder_old_mt,
+        v.axis_old_mt,
+        v.sphere_new_mp,
+        v.cylinder_new_mp,
+        v.axis_new_mp,
+        v.sphere_new_mt,
+        v.cylinder_new_mt,
+        v.axis_new_mt,
+        v.next_appointment_date,
+        v.clinical_diagnosis,
+        req.user.id,
+      ]
+    );
+
+    res.status(201).json(normalizePatientExamResultRow(result.rows[0]));
+  } catch (err) {
+    if (err.code === '23503') {
+      return res.status(404).json({ error: 'Không tìm thấy hồ sơ.' });
+    }
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'Ngày khám này đã có kết quả. Hãy sửa kết quả hiện có thay vì tạo mới.' });
+    }
+    next(err);
+  }
+}
+
+async function updatePatientExamResult(req, res, next) {
+  try {
+    const profileId = Number(req.params.id);
+    const resultId = Number(req.params.resultId);
+    if (!Number.isInteger(profileId) || profileId <= 0 || !Number.isInteger(resultId) || resultId <= 0) {
+      return res.status(400).json({ error: 'Kết quả khám không hợp lệ.' });
+    }
+
+    const validation = validatePatientExamResultPayload(req.body);
+    if (validation.error) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const v = validation.value;
+    const result = await pool.query(
+      `UPDATE patient_exam_results SET
+        exam_date = $1,
+        quick_medical_assessment = $2,
+        va_unaided_mp = $3,
+        va_unaided_mt = $4,
+        va_unaided_binocular = $5,
+        va_old_mp = $6,
+        va_old_mt = $7,
+        va_old_binocular = $8,
+        va_new_mp = $9,
+        va_new_mt = $10,
+        va_new_binocular = $11,
+        sphere_old_mp = $12,
+        cylinder_old_mp = $13,
+        axis_old_mp = $14,
+        sphere_old_mt = $15,
+        cylinder_old_mt = $16,
+        axis_old_mt = $17,
+        sphere_new_mp = $18,
+        cylinder_new_mp = $19,
+        axis_new_mp = $20,
+        sphere_new_mt = $21,
+        cylinder_new_mt = $22,
+        axis_new_mt = $23,
+        next_appointment_date = $24,
+        clinical_diagnosis = $25,
+        updated_at = NOW()
+       WHERE id = $26 AND patient_profile_id = $27
+       RETURNING *`,
+      [
+        v.exam_date,
+        v.quick_medical_assessment,
+        v.va_unaided_mp,
+        v.va_unaided_mt,
+        v.va_unaided_binocular,
+        v.va_old_mp,
+        v.va_old_mt,
+        v.va_old_binocular,
+        v.va_new_mp,
+        v.va_new_mt,
+        v.va_new_binocular,
+        v.sphere_old_mp,
+        v.cylinder_old_mp,
+        v.axis_old_mp,
+        v.sphere_old_mt,
+        v.cylinder_old_mt,
+        v.axis_old_mt,
+        v.sphere_new_mp,
+        v.cylinder_new_mp,
+        v.axis_new_mp,
+        v.sphere_new_mt,
+        v.cylinder_new_mt,
+        v.axis_new_mt,
+        v.next_appointment_date,
+        v.clinical_diagnosis,
+        resultId,
+        profileId,
+      ]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: 'Không tìm thấy kết quả khám.' });
+    }
+
+    res.json(normalizePatientExamResultRow(result.rows[0]));
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'Ngày khám này đã có kết quả khác trong hồ sơ.' });
+    }
+    next(err);
+  }
+}
+
+async function deletePatientExamResult(req, res, next) {
+  try {
+    const profileId = Number(req.params.id);
+    const resultId = Number(req.params.resultId);
+    if (!Number.isInteger(profileId) || profileId <= 0 || !Number.isInteger(resultId) || resultId <= 0) {
+      return res.status(400).json({ error: 'Kết quả khám không hợp lệ.' });
+    }
+
+    const result = await pool.query(
+      `DELETE FROM patient_exam_results
+       WHERE id = $1 AND patient_profile_id = $2
+       RETURNING id`,
+      [resultId, profileId]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: 'Không tìm thấy kết quả khám.' });
+    }
+
+    res.status(204).send();
   } catch (err) {
     next(err);
   }
@@ -463,6 +1295,18 @@ module.exports = {
   updateWheelPrize,
   deleteWheelPrize,
   listWheelSpins,
+  listEyewearProducts,
+  createEyewearProduct,
+  updateEyewearProduct,
+  deleteEyewearProduct,
+  reindexEyewearProducts,
   verifyWheelClaim,
   redeemWheelClaim,
+  listPatientRecords,
+  getPatientRecord,
+  createPatientRecord,
+  updatePatientRecord,
+  createPatientExamResult,
+  updatePatientExamResult,
+  deletePatientExamResult,
 };

@@ -10,6 +10,10 @@ const {
   hashClaimToken,
   buildClaimQrPayload,
 } = require('../utils/wheel');
+const {
+  searchProducts: searchEyewearProductsByElastic,
+  isEnabled: isEyewearSearchEnabled,
+} = require('../services/eyewearSearch.service');
 
 async function getDefaultAccount(req, res, next) {
   try {
@@ -95,6 +99,262 @@ async function getWheelPrizes(req, res, next) {
     );
 
     res.json(result.rows.map(normalizePrizeRow));
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getEyewearProducts(req, res, next) {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, brand, frame_type, price, description, image_url, quantity, is_active, sort_order, created_at, updated_at
+       FROM eyewear_products
+       WHERE is_active = TRUE
+       ORDER BY sort_order ASC, id ASC`
+    );
+
+    res.json(
+      result.rows.map((row) => ({
+        id: Number(row.id),
+        name: row.name,
+        brand: row.brand || 'Khác',
+        frame_type: row.frame_type || 'Khác',
+        price: Number(row.price || 0),
+        description: row.description || '',
+        image_url: row.image_url,
+        quantity: Number(row.quantity || 0),
+        is_active: row.is_active !== false,
+        sort_order: Number(row.sort_order || 0),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      }))
+    );
+  } catch (err) {
+    next(err);
+  }
+}
+
+function parseNumeric(value) {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function normalizePublicPatientRecordRow(row) {
+  if (!row) return null;
+  const num = (value) => (value === null || value === undefined ? null : Number(value));
+
+  return {
+    id: Number(row.id),
+    patient_profile_id: row.patient_profile_id === null || row.patient_profile_id === undefined ? undefined : Number(row.patient_profile_id),
+    full_name: row.full_name,
+    birth_year: row.birth_year === null || row.birth_year === undefined ? null : Number(row.birth_year),
+    exam_date:
+      row.exam_date instanceof Date
+        ? row.exam_date.toISOString().slice(0, 10)
+        : String(row.exam_date).slice(0, 10),
+    phone: row.phone || '',
+    address: row.address || '',
+    quick_medical_assessment: row.quick_medical_assessment || '',
+    va_unaided_mp: row.va_unaided_mp || '',
+    va_unaided_mt: row.va_unaided_mt || '',
+    va_unaided_binocular: row.va_unaided_binocular || '',
+    va_old_mp: row.va_old_mp || '',
+    va_old_mt: row.va_old_mt || '',
+    va_old_binocular: row.va_old_binocular || '',
+    va_new_mp: row.va_new_mp || '',
+    va_new_mt: row.va_new_mt || '',
+    va_new_binocular: row.va_new_binocular || '',
+    sphere_old_mp: num(row.sphere_old_mp),
+    cylinder_old_mp: num(row.cylinder_old_mp),
+    axis_old_mp: row.axis_old_mp === null || row.axis_old_mp === undefined ? null : Number(row.axis_old_mp),
+    sphere_old_mt: num(row.sphere_old_mt),
+    cylinder_old_mt: num(row.cylinder_old_mt),
+    axis_old_mt: row.axis_old_mt === null || row.axis_old_mt === undefined ? null : Number(row.axis_old_mt),
+    sphere_new_mp: num(row.sphere_new_mp),
+    cylinder_new_mp: num(row.cylinder_new_mp),
+    axis_new_mp: row.axis_new_mp === null || row.axis_new_mp === undefined ? null : Number(row.axis_new_mp),
+    sphere_new_mt: num(row.sphere_new_mt),
+    cylinder_new_mt: num(row.cylinder_new_mt),
+    axis_new_mt: row.axis_new_mt === null || row.axis_new_mt === undefined ? null : Number(row.axis_new_mt),
+    next_appointment_date:
+      row.next_appointment_date instanceof Date
+        ? row.next_appointment_date.toISOString().slice(0, 10)
+        : row.next_appointment_date
+          ? String(row.next_appointment_date).slice(0, 10)
+          : null,
+    clinical_diagnosis: row.clinical_diagnosis || '',
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+async function getPatientRecordsByPhone(req, res, next) {
+  try {
+    const phone = String(req.query.phone || '').trim();
+    const digits = phone.replace(/\D/g, '');
+
+    if (digits.length < 8 || digits.length > 20) {
+      return res.status(400).json({ error: 'Số điện thoại không hợp lệ.' });
+    }
+
+    const result = await pool.query(
+      `SELECT r.*,
+              p.id AS patient_profile_id,
+              p.full_name,
+              p.birth_year,
+              p.phone,
+              p.address
+       FROM patient_profiles p
+       JOIN patient_exam_results r ON r.patient_profile_id = p.id
+       WHERE p.phone_digits = $1
+       ORDER BY r.exam_date DESC, r.id DESC
+       LIMIT 20`,
+      [digits]
+    );
+
+    res.json(result.rows.map(normalizePublicPatientRecordRow));
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function searchEyewearProducts(req, res, next) {
+  try {
+    const q = String(req.query.q || '').trim();
+    const brand = String(req.query.brand || '').trim();
+    const frameType = String(req.query.frame_type || '').trim();
+    const minPrice = parseNumeric(req.query.min_price);
+    const maxPrice = parseNumeric(req.query.max_price);
+    const page = Math.max(1, Number.parseInt(String(req.query.page || '1'), 10) || 1);
+    const size = Math.min(48, Math.max(1, Number.parseInt(String(req.query.size || '12'), 10) || 12));
+
+    if (isEyewearSearchEnabled) {
+      try {
+        const result = await searchEyewearProductsByElastic({
+          q,
+          brand,
+          frameType,
+          minPrice,
+          maxPrice,
+          page,
+          size,
+        });
+        console.log(
+          '[eyewear-search][elasticsearch]',
+          JSON.stringify({
+            q,
+            brand,
+            frame_type: frameType,
+            min_price: minPrice,
+            max_price: maxPrice,
+            page,
+            size,
+            total: result?.pagination?.total || 0,
+            items: result?.items?.length || 0,
+            top_ids: (result?.items || []).slice(0, 5).map((item) => item.id),
+          })
+        );
+        console.log('[eyewear-search][elasticsearch][result]', JSON.stringify(result));
+        return res.json({
+          ...result,
+          engine: 'elasticsearch',
+        });
+      } catch (error) {
+        console.error('❌ Elasticsearch search fallback to SQL:', error.message);
+      }
+    }
+
+    const values = [];
+    const conditions = ['is_active = TRUE'];
+
+    if (q) {
+      values.push(`%${q}%`);
+      const qIndex = values.length;
+      conditions.push(`(name ILIKE $${qIndex} OR description ILIKE $${qIndex} OR brand ILIKE $${qIndex} OR frame_type ILIKE $${qIndex})`);
+    }
+
+    if (brand) {
+      values.push(brand);
+      conditions.push(`brand = $${values.length}`);
+    }
+
+    if (frameType) {
+      values.push(frameType);
+      conditions.push(`frame_type = $${values.length}`);
+    }
+
+    if (minPrice != null) {
+      values.push(minPrice);
+      conditions.push(`price >= $${values.length}`);
+    }
+
+    if (maxPrice != null) {
+      values.push(maxPrice);
+      conditions.push(`price <= $${values.length}`);
+    }
+
+    const whereClause = conditions.join(' AND ');
+    const offset = (page - 1) * size;
+
+    const [itemsResult, countResult, facetResult] = await Promise.all([
+      pool.query(
+        `SELECT id, name, brand, frame_type, price, description, image_url, quantity, is_active, sort_order, created_at, updated_at
+         FROM eyewear_products
+         WHERE ${whereClause}
+         ORDER BY sort_order ASC, updated_at DESC
+         LIMIT $${values.length + 1}
+         OFFSET $${values.length + 2}`,
+        [...values, size, offset]
+      ),
+      pool.query(`SELECT COUNT(*)::int AS total FROM eyewear_products WHERE ${whereClause}`, values),
+      pool.query(
+        `SELECT
+           COALESCE(array_remove(array_agg(DISTINCT brand ORDER BY brand), NULL), ARRAY[]::text[]) AS brands,
+           COALESCE(array_remove(array_agg(DISTINCT frame_type ORDER BY frame_type), NULL), ARRAY[]::text[]) AS frame_types,
+           COALESCE(MIN(price), 0)::float AS min_price,
+           COALESCE(MAX(price), 0)::float AS max_price
+         FROM eyewear_products
+         WHERE is_active = TRUE`
+      ),
+    ]);
+
+    const total = Number(countResult.rows[0]?.total || 0);
+    const facets = facetResult.rows[0] || { brands: [], frame_types: [], min_price: 0, max_price: 0 };
+
+    return res.json({
+      items: itemsResult.rows.map((row) => ({
+        id: Number(row.id),
+        name: row.name,
+        brand: row.brand || 'Khác',
+        frame_type: row.frame_type || 'Khác',
+        price: Number(row.price || 0),
+        description: row.description || '',
+        image_url: row.image_url,
+        quantity: Number(row.quantity || 0),
+        is_active: row.is_active !== false,
+        sort_order: Number(row.sort_order || 0),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      })),
+      pagination: {
+        page,
+        size,
+        total,
+        total_pages: Math.max(1, Math.ceil(total / size)),
+      },
+      facets: {
+        brands: facets.brands || [],
+        frame_types: facets.frame_types || [],
+        price: {
+          min: Number(facets.min_price || 0),
+          max: Number(facets.max_price || 0),
+        },
+      },
+      engine: 'sql_fallback',
+    });
   } catch (err) {
     next(err);
   }
@@ -455,6 +715,9 @@ module.exports = {
   getDefaultAccount,
   createAppointment,
   getAvailability,
+  getEyewearProducts,
+  searchEyewearProducts,
+  getPatientRecordsByPhone,
   getWheelPrizes,
   getWheelSettings,
   getRecentRedeemedWinners,
